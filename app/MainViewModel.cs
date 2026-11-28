@@ -179,23 +179,26 @@ internal sealed partial class MainViewModel(LayoutStore store, DesktopIcons desk
     /// <summary>Reports verified, adjusted, unverified, and skipped icon positions separately.</summary>
     internal static string DescribeRestore(RestoreResult result, int savedCount)
     {
-        if (savedCount == 0)
-            return "This layout contains no desktop icons.";
-        if (result.Matched == 0)
-            return "No saved icons matched the current desktop.";
-
         int verified = result.Matched - result.Adjusted - result.Unverified;
-        string status = result.Adjusted > 0 || result.Unverified > 0
-            ? $"Confirmed {verified} of {result.Matched} matching icons at their saved positions."
-            : $"Restored {verified} desktop {(verified == 1 ? "icon" : "icons")}.";
+        string status = savedCount == 0 ? "This layout contains no desktop icons."
+            : result.Matched == 0 ? "No saved icons were repositioned."
+            : result.Adjusted > 0 || result.Unverified > 0
+                ? $"Confirmed {verified} of {result.Matched} matching icons at their saved positions."
+                : $"Restored {verified} desktop {(verified == 1 ? "icon" : "icons")}.";
         if (result.Adjusted > 0)
             status += $" Windows adjusted {result.Adjusted}.";
         if (result.Unverified > 0)
             status += $" Could not verify {result.Unverified} after requesting the moves.";
-        if (result.Missing > 0)
+        if (result.Missing > 0 && result.Matched > 0)
             status += $" {result.Missing} saved {(result.Missing == 1 ? "icon did" : "icons did")} not match.";
         if (result.Skipped > 0)
             status += $" Skipped {result.Skipped} {(result.Skipped == 1 ? "icon" : "icons")} on unavailable screens.";
+        if (result.Grouped > 0)
+            status += $" Moved {result.Grouped} new {(result.Grouped == 1 ? "shortcut" : "shortcuts")} into “{NewDesktopShortcuts.FolderName}”.";
+        if (result.GroupingFailed > 0)
+            status += $" Could not move {result.GroupingFailed} new {(result.GroupingFailed == 1 ? "shortcut" : "shortcuts")} into the folder.";
+        if (result.FolderPositionUnverified)
+            status += $" Could not confirm the position of “{NewDesktopShortcuts.FolderName}”.";
         return status;
     }
 

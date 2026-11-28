@@ -14,7 +14,7 @@ internal static class DesktopDisplays
     private const int PerMonitorAware = 2;
 
     /// <summary>Enumerates the active desktop surfaces in physical pixels.</summary>
-    public static DesktopScreen[] ReadScreens()
+    public static DesktopScreen[] ReadScreens(bool workAreas = false)
     {
         var screens = new List<DesktopScreen>();
         HashSet<string> mirrorDevices = GetMirrorDevices();
@@ -24,7 +24,7 @@ internal static class DesktopDisplays
             if (!GetMonitorInfoW(monitor, ref info) || string.IsNullOrWhiteSpace(info.DeviceName))
                 return false;
 
-            MonitorRect area = info.Monitor;
+            MonitorRect area = workAreas ? info.WorkArea : info.Monitor;
             if (area.Right > area.Left && area.Bottom > area.Top && !mirrorDevices.Contains(info.DeviceName))
             {
                 screens.Add(new DesktopScreen(info.DeviceName, GetMonitorId(info.DeviceName), area.Left, area.Top,

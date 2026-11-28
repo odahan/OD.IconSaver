@@ -1,11 +1,13 @@
+using System.IO;
 using System.Runtime.InteropServices;
 using System.Windows.Threading;
 
 namespace IconSaver;
 
-internal sealed class DesktopUnavailableException(string message, Exception? inner = null) : Exception(message, inner);
+internal class DesktopUnavailableException(string message, Exception? inner = null) : Exception(message, inner);
 
-internal readonly record struct RestoreResult(int Matched, int Missing, int Adjusted, int Unverified, int Skipped = 0);
+internal readonly record struct RestoreResult(int Matched, int Missing, int Adjusted, int Unverified, int Skipped = 0,
+    int Grouped = 0, int GroupingFailed = 0, bool FolderPositionUnverified = false);
 
 internal sealed record RestoreAttempt(RestoreResult? Result, ScreenRestorePlan? ScreenPlan = null);
 
@@ -17,6 +19,7 @@ internal sealed class DesktopIcons : IDisposable
     private const uint PositionItem = 0x80;
     private const uint NormalDisplayName = 0;
     private const uint DesktopAbsoluteParsing = 0x80028000;
+    private const uint FileSystemPath = 0x80058000;
     private static readonly Guid TopLevelBrowser = new("4C96BE40-915C-11CF-99D3-00AA004AE837");
     private readonly Lazy<Task<Dispatcher>> apartment = new(StartApartment);
 
@@ -50,8 +53,8 @@ internal sealed class DesktopIcons : IDisposable
                 .Select(match => match.LegacyMatch).OfType<LegacyLabelMatch>().ToArray()));
     }
 
-    /// <summary>Rechecks the live identities before applying exact or approved legacy matches.</summary>
-    public Task<RestoreAttempt> RestoreAsync(SavedLayout layout, LegacyLabelMatch[] approvedMatches,
+    /// <summary>Groups new shortcuts, waits for Explorer to discover the folder, and restores the live layout.</summary>
+    public async Task<RestoreAttempt> RestoreAsync(SavedLayout layout, LegacyLabelMatch[] approvedMatches,
         PartialScreenApproval? approvedScreens = null)
     {
         if (layout.FormatVersion == 0 && layout.Icons.Length > 1 &&
@@ -62,35 +65,201 @@ internal sealed class DesktopIcons : IDisposable
         }
 
         var approved = approvedMatches.ToHashSet();
-        return InvokeAsync(() => WithDesktop((view, shellView, items) =>
-            RestorePositions(view, shellView, items, layout, approved, approvedScreens)));
+        var prepared = await InvokeAsync(() => WithDesktop((view, shellView, items) =>
+            PrepareRestore(view, shellView, items, layout, approved, approvedScreens))).ConfigureAwait(false);
+        if (prepared.Attempt is { } attempt)
+            return attempt;
+
+        PendingRestore pending = prepared.Pending!;
+        for (int retry = 0; ; retry++)
+        {
+            bool waitForExplorer = retry < 19 && pending.Grouped > 0;
+            try
+            {
+                RestoreResult? result = await InvokeAsync(() => WithDesktop((view, shellView, items) =>
+                    FinishRestore(view, shellView, items, pending, waitForExplorer))).ConfigureAwait(false);
+                if (result is { } complete)
+                    return new RestoreAttempt(complete);
+            }
+            catch (DesktopItemsChangedException) when (waitForExplorer)
+            {
+            }
+
+            await Task.Delay(100).ConfigureAwait(false);
+        }
     }
 
-    private static RestoreAttempt RestorePositions(IFolderView view, object shellView, List<DesktopItem> items,
+    private static (RestoreAttempt? Attempt, PendingRestore? Pending) PrepareRestore(
+        IFolderView view, object shellView, List<DesktopItem> items,
         SavedLayout layout, HashSet<LegacyLabelMatch> approvedMatches, PartialScreenApproval? approvedScreens)
     {
         LayoutMatch[] matches = LayoutMatcher.Find(layout, Identities(items), approvedMatches.Contains);
         int missing = layout.Icons.Length - matches.Length;
-        if (matches.Length == 0)
-            return new RestoreAttempt(new RestoreResult(0, missing, 0, 0));
-
-        if (layout.Screens is not { } savedScreens)
+        DesktopScreen[]? screens = null;
+        int skipped = 0;
+        PlannedMove[] targets;
+        if (layout.Screens is { } savedScreens && matches.Length > 0)
         {
-            IconMove[] original = matches.Select(match => new IconMove(items[match.CurrentIndex].Pidl,
+            screens = DesktopDisplays.ReadScreens();
+            ScreenRestorePlan plan = ScreenLayout.Plan(savedScreens, screens, matches);
+            if (plan.Decide(approvedScreens) != ScreenRestoreDecision.Proceed)
+                return (new RestoreAttempt(null, plan), null);
+
+            DesktopDisplays.IconViewCoordinates coordinates = GetIconViewCoordinates(shellView);
+            targets = plan.Targets.Select(target => new PlannedMove(target.CurrentIconIndex,
+                coordinates.ToView(new DesktopPoint(target.X, target.Y)))).ToArray();
+            skipped = plan.Approval.SkippedIcons.Length;
+        }
+        else
+        {
+            targets = matches.Select(match => new PlannedMove(match.CurrentIndex,
                 new DesktopPoint(match.Saved.X, match.Saved.Y))).ToArray();
-            return new RestoreAttempt(ApplyPositions(view, original, missing, 0, null));
         }
 
-        DesktopScreen[] activeScreens = DesktopDisplays.ReadScreens();
-        ScreenRestorePlan plan = ScreenLayout.Plan(savedScreens, activeScreens, matches);
-        if (plan.Decide(approvedScreens) != ScreenRestoreDecision.Proceed)
-            return new RestoreAttempt(null, plan);
+        string[] shortcuts = FindNewShortcuts(items, layout, matches);
+        if (shortcuts.Length == 0)
+        {
+            IconMove[] moves = targets.Select(target => new IconMove(items[target.Index].Pidl, target.Position)).ToArray();
+            return (new RestoreAttempt(ApplyPositions(view, moves, missing, skipped, screens)), null);
+        }
 
-        DesktopDisplays.IconViewCoordinates coordinates = GetIconViewCoordinates(shellView);
-        IconMove[] targets = plan.Targets.Select(target => new IconMove(items[target.CurrentIconIndex].Pidl,
-            coordinates.ToView(new DesktopPoint(target.X, target.Y)))).ToArray();
-        return new RestoreAttempt(ApplyPositions(view, targets, missing, plan.Approval.SkippedIcons.Length, activeScreens));
+        EnsureManualArrangement(view);
+        foreach (PlannedMove target in targets)
+            _ = ReadPosition(view, items[target.Index].Pidl);
+        if (screens is not null)
+            VerifyScreenConfiguration(screens);
+
+        string desktop = Environment.GetFolderPath(Environment.SpecialFolder.DesktopDirectory);
+        string folder = Path.Combine(desktop, NewDesktopShortcuts.FolderName);
+        var moved = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        foreach (string shortcut in shortcuts)
+        {
+            try
+            {
+                if (moved.Count == 0)
+                {
+                    var directory = Directory.CreateDirectory(folder);
+                    if (directory.LinkTarget is not null)
+                        break;
+                }
+
+                NewDesktopShortcuts.Move(shortcut, folder);
+                moved.Add(shortcut);
+            }
+            catch (Exception error) when (error is IOException or UnauthorizedAccessException)
+            {
+                continue;
+            }
+        }
+
+        var savedMoves = targets.ToDictionary(target => items[target.Index].Identity.Id, target => target.Position,
+            StringComparer.Ordinal);
+        return (null, new PendingRestore(savedMoves, screens, folder, moved, missing, skipped, shortcuts.Length - moved.Count));
     }
+
+    private static string[] FindNewShortcuts(List<DesktopItem> items, SavedLayout layout, LayoutMatch[] matches)
+    {
+        string desktop = Environment.GetFolderPath(Environment.SpecialFolder.DesktopDirectory);
+        if (desktop.Length == 0)
+            return [];
+
+        string sharedDesktop = Environment.GetFolderPath(Environment.SpecialFolder.CommonDesktopDirectory);
+        var matched = matches.Select(match => match.CurrentIndex).ToHashSet();
+        var savedIds = layout.Icons.Select(icon => icon.Id).ToHashSet(StringComparer.Ordinal);
+        var legacyLabels = layout.FormatVersion == 0
+            ? layout.Icons.Where(LayoutMatcher.CanMatchByLabel).Select(icon => icon.Label).ToHashSet(StringComparer.Ordinal)
+            : [];
+        return items.Where((item, index) => !matched.Contains(index) && !savedIds.Contains(item.Identity.Id) &&
+                !legacyLabels.Contains(item.Identity.Label))
+            .Select(item => ReadName(item.Pidl, FileSystemPath))
+            .OfType<string>()
+            .Where(path => NewDesktopShortcuts.IsShortcut(path) && File.Exists(path) &&
+                (PathEquals(Path.GetDirectoryName(path), desktop) || PathEquals(Path.GetDirectoryName(path), sharedDesktop)))
+            .Distinct(StringComparer.OrdinalIgnoreCase).ToArray();
+    }
+
+    private static RestoreResult? FinishRestore(IFolderView view, object shellView, List<DesktopItem> items,
+        PendingRestore pending, bool waitForExplorer)
+    {
+        DesktopItem folder = default;
+        if (pending.Grouped > 0)
+        {
+            folder = items.FirstOrDefault(item => PathEquals(ReadName(item.Pidl, FileSystemPath), pending.Folder));
+            if (waitForExplorer && (folder.Pidl == IntPtr.Zero ||
+                items.Any(item => ReadName(item.Pidl, FileSystemPath) is { } path && pending.Moved.Contains(path))))
+                return null;
+        }
+
+        var restored = items.GroupBy(item => item.Identity.Id, StringComparer.Ordinal)
+            .Where(group => group.Count() == 1 && pending.Targets.ContainsKey(group.Key))
+            .Select(group => group.First()).ToArray();
+        IconMove[] moves = restored.Where(item => item.Pidl != folder.Pidl)
+            .Select(item => new IconMove(item.Pidl, pending.Targets[item.Identity.Id])).ToArray();
+        RestoreResult result = ApplyPositions(view, moves, pending.Missing + pending.Targets.Count - restored.Length,
+            pending.Skipped, pending.Screens);
+
+        bool folderPositionVerified = pending.Grouped == 0 || TryPositionFolder(view, shellView, items, restored, folder);
+        return result with
+        {
+            Grouped = pending.Grouped,
+            GroupingFailed = pending.Failed,
+            FolderPositionUnverified = !folderPositionVerified
+        };
+    }
+
+    private static bool TryPositionFolder(IFolderView view, object shellView, List<DesktopItem> items,
+        DesktopItem[] restored, DesktopItem folder)
+    {
+        if (folder.Pidl == IntPtr.Zero)
+            return false;
+
+        try
+        {
+            EnsureManualArrangement(view);
+            if (view.GetSpacing(out DesktopPoint spacing) != 0 || spacing.X <= 0 || spacing.Y <= 0)
+                return false;
+
+            DesktopDisplays.IconViewCoordinates coordinates = GetIconViewCoordinates(shellView);
+            DesktopScreen[] areas = DesktopDisplays.ReadScreens(workAreas: true);
+            var positions = items.Where(item => item.Pidl != folder.Pidl)
+                .ToDictionary(item => item.Pidl, item => ReadPosition(view, item.Pidl));
+            DesktopPoint[] occupied = positions.Values.ToArray();
+            DesktopItem[] otherRestored = restored.Where(item => item.Pidl != folder.Pidl).ToArray();
+            DesktopItem[] restoredShortcuts = otherRestored.Where(item =>
+                ReadName(item.Pidl, FileSystemPath) is { } path && NewDesktopShortcuts.IsShortcut(path)).ToArray();
+            DesktopPoint[] anchors = (restoredShortcuts.Length > 0 ? restoredShortcuts : otherRestored)
+                .Select(item => positions[item.Pidl]).ToArray();
+            var areaAnchors = anchors.Select(point =>
+            {
+                DesktopPoint screenPoint = coordinates.ToScreen(point);
+                return (Point: point, Area: Array.FindIndex(areas, area => area.Contains(screenPoint.X, screenPoint.Y)));
+            }).Where(entry => entry.Area >= 0).ToArray();
+            int preferredArea = areaAnchors.Length == 0 ? 0 : areaAnchors.Max(entry => entry.Area);
+            foreach (int index in Enumerable.Range(0, areas.Length).OrderBy(index => index != preferredArea))
+            {
+                DesktopScreen area = areas[index];
+                DesktopPoint start = coordinates.ToView(new DesktopPoint(area.Left, area.Top));
+                DesktopPoint end = coordinates.ToView(new DesktopPoint(area.Left + area.Width, area.Top + area.Height));
+                DesktopPoint? last = areaAnchors.Where(entry => entry.Area == index).Select(entry => (DesktopPoint?)entry.Point)
+                    .OrderBy(point => (point!.Value.X - start.X + spacing.X / 2) / spacing.X)
+                    .ThenBy(point => point!.Value.Y).LastOrDefault();
+                if (NewDesktopShortcuts.FindPosition(last, start, end, spacing, occupied) is not { } position)
+                    continue;
+
+                RestoreResult result = ApplyPositions(view, [new IconMove(folder.Pidl, position)], 0, 0, null);
+                return result.Adjusted == 0 && result.Unverified == 0;
+            }
+        }
+        catch (Exception error) when (error is DesktopUnavailableException || IsInteropException(error))
+        {
+            return false;
+        }
+
+        return false;
+    }
+
+    private static bool PathEquals(string? left, string right) =>
+        string.Equals(left, right, StringComparison.OrdinalIgnoreCase);
 
     private static RestoreResult ApplyPositions(IFolderView view, IconMove[] targets, int missing, int skipped,
         DesktopScreen[]? activeScreens)
@@ -103,13 +272,7 @@ internal sealed class DesktopIcons : IDisposable
             return new RestoreResult(targets.Length, missing, 0, 0, skipped);
         }
 
-        int autoArrange = view.GetAutoArrange();
-        CheckShellFailure(autoArrange, "Windows Explorer could not read the desktop arrangement mode");
-        if (autoArrange == 0)
-        {
-            throw new DesktopUnavailableException(
-                "Turn off Auto arrange icons in the desktop’s View menu, then try restoring again.");
-        }
+        EnsureManualArrangement(view);
 
         IntPtr[] pidls = changes.Select(change => change.Pidl).ToArray();
         DesktopPoint[] positions = changes.Select(change => change.Position).ToArray();
@@ -134,6 +297,15 @@ internal sealed class DesktopIcons : IDisposable
         }
 
         return new RestoreResult(targets.Length, missing, adjusted, unverified, skipped);
+    }
+
+    private static void EnsureManualArrangement(IFolderView view)
+    {
+        int autoArrange = view.GetAutoArrange();
+        CheckShellFailure(autoArrange, "Windows Explorer could not read the desktop arrangement mode");
+        if (autoArrange == 0)
+            throw new DesktopUnavailableException(
+                "Turn off Auto arrange icons in the desktop’s View menu, then try restoring again.");
     }
 
     private static DesktopItemIdentity[] Identities(List<DesktopItem> items) =>
@@ -244,7 +416,7 @@ internal sealed class DesktopIcons : IDisposable
                 {
                     CheckShellFailure(result, "Windows Explorer could not read a desktop icon");
                     if (pidl == IntPtr.Zero)
-                        throw new DesktopUnavailableException("The desktop icons changed during the operation. Try again.");
+                        throw new DesktopItemsChangedException();
                     var identity = new DesktopItemIdentity(GetIdentity(pidl), ReadName(pidl, NormalDisplayName));
                     items.Add(new DesktopItem(identity, pidl));
                 }
@@ -258,7 +430,7 @@ internal sealed class DesktopIcons : IDisposable
             CheckShellFailure(view.ItemCount(AllViewItems, out int currentCount),
                 "Windows Explorer could not count the desktop icons");
             if (currentCount != count)
-                throw new DesktopUnavailableException("The desktop icons changed during the operation. Try again.");
+                throw new DesktopItemsChangedException();
 
             return action(view, shellView, items);
         }
@@ -311,6 +483,17 @@ internal sealed class DesktopIcons : IDisposable
     private readonly record struct DesktopItem(DesktopItemIdentity Identity, IntPtr Pidl);
 
     private readonly record struct IconMove(IntPtr Pidl, DesktopPoint Position);
+
+    private readonly record struct PlannedMove(int Index, DesktopPoint Position);
+
+    private sealed class DesktopItemsChangedException()
+        : DesktopUnavailableException("The desktop icons changed during the operation. Try again.");
+
+    private sealed record PendingRestore(Dictionary<string, DesktopPoint> Targets, DesktopScreen[]? Screens,
+        string Folder, HashSet<string> Moved, int Missing, int Skipped, int Failed)
+    {
+        public int Grouped => Moved.Count;
+    }
 
     [DllImport("shell32.dll", ExactSpelling = true)]
     private static extern int SHGetNameFromIDList(IntPtr pidl, uint nameType, out IntPtr name);
@@ -398,7 +581,8 @@ internal sealed class DesktopIcons : IDisposable
         [PreserveSig]
         int GetItemPosition(IntPtr pidl, out DesktopPoint point);
 
-        void GetSpacing();
+        [PreserveSig]
+        int GetSpacing(out DesktopPoint spacing);
         void GetDefaultSpacing();
 
         [PreserveSig]
